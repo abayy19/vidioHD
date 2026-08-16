@@ -1,8 +1,0 @@
-streamlit>=1.32.0
-opencv-python-headless>=4.8.0
-numpy>=1.24.0
-
-# Opsional (tidak wajib untuk menjalankan versi dasar):
-# Aktifkan baris di bawah ini jika ingin mengembangkan fitur penggabungan
-# audio asli ke video hasil proses (lihat komentar TODO di video_app.py):
-# moviepy>=1.0.3
