@@ -27,6 +27,8 @@ Cara menjalankan:
 """
 
 import os
+import shutil
+import subprocess
 import tempfile
 import time
 
@@ -280,6 +282,50 @@ def apply_filter(frame: np.ndarray, filter_name: str, **kwargs) -> np.ndarray:
 # =====================================================================
 
 
+def ffmpeg_available() -> bool:
+    """Cek apakah binary FFmpeg tersedia di server (diinstal via packages.txt)."""
+    return shutil.which("ffmpeg") is not None
+
+
+def normalize_video_with_ffmpeg(input_path: str, output_path: str) -> bool:
+    """
+    Konversi video apa pun (termasuk .mov dari iPhone dengan codec HEVC/H.265
+    dan metadata rotasi) menjadi file .mp4 berformat H.264 standar yang bisa
+    dibaca dengan andal oleh OpenCV.
+
+    FFmpeg otomatis "membakar" rotasi metadata ke dalam piksel video saat
+    transcoding, sehingga masalah video iPhone portrait yang muncul miring/
+    landscape saat dibaca OpenCV langsung dapat teratasi.
+
+    Mengembalikan True jika konversi berhasil, False jika FFmpeg tidak
+    tersedia atau proses konversi gagal (dalam hal ini, aplikasi akan
+    mencoba membaca file asli secara langsung sebagai fallback).
+    """
+    if not ffmpeg_available():
+        return False
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                "-an",  # Buang audio di tahap ini (tetap tidak dipakai OpenCV)
+                output_path,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=600,
+        )
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
 def get_video_info(video_path: str) -> dict:
     """Ambil metadata video: fps, jumlah frame, lebar, tinggi, durasi (detik)."""
     cap = cv2.VideoCapture(video_path)
@@ -380,7 +426,8 @@ def setup_page():
     )
     st.title("🎬 AI Video Enhancer & Filter")
     st.caption(
-        "Tingkatkan kualitas video Anda atau terapkan filter estetik (termasuk gaya iPhone)."
+        "Tingkatkan kualitas video Anda atau terapkan filter estetik (termasuk gaya iPhone). "
+        "Mendukung format MP4, MOV (termasuk video iPhone/HEVC), AVI, dan MKV."
     )
     st.warning(
         "⚠️ Video hasil proses saat ini **tidak menyertakan audio** "
@@ -516,13 +563,37 @@ def main():
 
     # Simpan file yang diunggah ke file sementara (VideoCapture butuh path file, bukan buffer)
     temp_dir = tempfile.mkdtemp()
-    input_path = os.path.join(temp_dir, "input_video" + os.path.splitext(uploaded_file.name)[1])
+    raw_input_path = os.path.join(temp_dir, "raw_input" + os.path.splitext(uploaded_file.name)[1])
+    input_path = os.path.join(temp_dir, "normalized_input.mp4")
     output_path = os.path.join(temp_dir, "output_video.mp4")
 
-    with open(input_path, "wb") as f:
+    with open(raw_input_path, "wb") as f:
         f.write(uploaded_file.read())
 
+    # Normalisasi video via FFmpeg agar format MOV/HEVC dari iPhone (dan
+    # rotasi metadata-nya) terbaca dengan benar oleh OpenCV.
+    with st.spinner("Menyiapkan video (menormalkan format & rotasi)..."):
+        converted = normalize_video_with_ffmpeg(raw_input_path, input_path)
+
+    if not converted:
+        # Fallback: FFmpeg tidak tersedia atau konversi gagal -> coba file asli langsung.
+        st.warning(
+            "⚠️ FFmpeg tidak tersedia/gagal melakukan normalisasi. Mencoba membaca "
+            "file asli secara langsung — untuk video iPhone (.mov/HEVC), ini bisa "
+            "gagal atau menghasilkan orientasi yang salah. Pastikan `packages.txt` "
+            "berisi `ffmpeg` sudah ada di repo Anda.",
+            icon="⚠️",
+        )
+        input_path = raw_input_path
+
     info = get_video_info(input_path)
+    if info["frame_count"] == 0 or info["width"] == 0:
+        st.error(
+            "❌ Video tidak dapat dibaca. Format file mungkin tidak didukung. "
+            "Coba unggah dalam format MP4 (H.264), atau pastikan FFmpeg terinstal "
+            "di server (lihat `packages.txt`)."
+        )
+        return
     st.markdown(
         f"**Info Video:** {info['width']}x{info['height']} px · "
         f"{info['fps']:.1f} FPS · {info['frame_count']} frame · "
