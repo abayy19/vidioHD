@@ -297,6 +297,11 @@ def normalize_video_with_ffmpeg(input_path: str, output_path: str) -> bool:
     transcoding, sehingga masalah video iPhone portrait yang muncul miring/
     landscape saat dibaca OpenCV langsung dapat teratasi.
 
+    PENTING: langkah ini TIDAK mengubah resolusi/rasio video (tidak ada
+    scaling/cropping) dan TETAP MEMPERTAHANKAN audio asli, sehingga file
+    hasil normalisasi ini nantinya dipakai sebagai sumber audio saat
+    digabungkan kembali ke video hasil proses (lihat merge_audio_with_ffmpeg).
+
     Mengembalikan True jika konversi berhasil, False jika FFmpeg tidak
     tersedia atau proses konversi gagal (dalam hal ini, aplikasi akan
     mencoba membaca file asli secara langsung sebagai fallback).
@@ -311,9 +316,10 @@ def normalize_video_with_ffmpeg(input_path: str, output_path: str) -> bool:
                 "-i", input_path,
                 "-c:v", "libx264",
                 "-preset", "fast",
-                "-crf", "20",
+                "-crf", "18",       # Kualitas tinggi, mendekati lossless
                 "-pix_fmt", "yuv420p",
-                "-an",  # Buang audio di tahap ini (tetap tidak dipakai OpenCV)
+                "-c:a", "aac",      # Audio tetap dipertahankan (di-transcode ke AAC agar kompatibel)
+                "-b:a", "192k",
                 output_path,
             ],
             check=True,
@@ -322,6 +328,67 @@ def normalize_video_with_ffmpeg(input_path: str, output_path: str) -> bool:
             timeout=600,
         )
         return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def has_audio_stream(video_path: str) -> bool:
+    """Cek apakah file video memiliki track audio (menggunakan ffprobe, satu paket dengan ffmpeg)."""
+    if shutil.which("ffprobe") is None:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index",
+                "-of", "csv=p=0",
+                video_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        return bool(result.stdout.strip())
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def merge_audio_with_ffmpeg(silent_video_path: str, audio_source_path: str, final_output_path: str) -> bool:
+    """
+    Gabungkan audio asli (dari audio_source_path) ke video hasil proses yang
+    masih bisu (silent_video_path, hasil dari OpenCV VideoWriter), menghasilkan
+    final_output_path yang sudah punya audio.
+
+    Menggunakan '-shortest' agar jika video hasil proses lebih pendek dari
+    audio asli (misalnya karena pengguna membatasi durasi diproses), audio
+    ikut terpotong menyesuaikan panjang video, sehingga tetap sinkron.
+
+    Video di-copy langsung (-c:v copy) tanpa re-encode ulang, sehingga
+    resolusi/rasio/kualitas visual dari hasil proses TIDAK berubah sama sekali.
+    """
+    if not ffmpeg_available():
+        return False
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", silent_video_path,
+                "-i", audio_source_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",   # Video tidak di-re-encode -> kualitas/resolusi/rasio tetap identik
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest",
+                final_output_path,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=600,
+        )
+        return os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 0
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
 
@@ -344,73 +411,10 @@ def get_video_info(video_path: str) -> dict:
     }
 
 
-def process_video(
-    input_path: str,
-    output_path: str,
-    process_frame_fn,
-    output_scale: float = 1.0,
-    progress_callback=None,
-) -> None:
-    """
-    Baca video dari input_path, terapkan process_frame_fn ke setiap frame,
-    lalu tulis hasilnya ke output_path.
-
-    Parameter:
-        process_frame_fn   : fungsi yang menerima 1 frame (np.ndarray BGR)
-                              dan mengembalikan 1 frame hasil olahan.
-        output_scale       : faktor tambahan untuk menyesuaikan ukuran
-                              VideoWriter jika process_frame_fn mengubah
-                              resolusi (misalnya saat upscale_factor > 1).
-        progress_callback   : fungsi callback(current_frame, total_frame)
-                              dipanggil setiap frame selesai diproses,
-                              berguna untuk update progress bar di UI.
-
-    ------------------------------------------------------------------
-    TODO (Mempertahankan Audio Asli):
-    ------------------------------------------------------------------
-    OpenCV VideoWriter TIDAK menyertakan audio. Jika audio perlu
-    dipertahankan, gabungkan audio asli ke video hasil proses dengan
-    moviepy setelah fungsi ini selesai dijalankan, contoh:
-
-        from moviepy.editor import VideoFileClip
-        original_clip = VideoFileClip(input_path)
-        processed_clip = VideoFileClip(output_path)
-        final_clip = processed_clip.set_audio(original_clip.audio)
-        final_clip.write_videofile("output_with_audio.mp4", codec="libx264")
-
-    (Butuh tambahan dependensi: moviepy dan ffmpeg)
-    ------------------------------------------------------------------
-    """
-    info = get_video_info(input_path)
-    cap = cv2.VideoCapture(input_path)
-
-    out_width = int(info["width"] * output_scale)
-    out_height = int(info["height"] * output_scale)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, info["fps"], (out_width, out_height))
-
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        processed = process_frame_fn(frame)
-
-        # Pastikan ukuran frame hasil sesuai dengan ukuran VideoWriter
-        if (processed.shape[1], processed.shape[0]) != (out_width, out_height):
-            processed = cv2.resize(processed, (out_width, out_height))
-
-        writer.write(processed)
-        frame_idx += 1
-
-        if progress_callback:
-            progress_callback(frame_idx, info["frame_count"])
-
-    cap.release()
-    writer.release()
-
+# Catatan: fungsi pemroses video utama ada di _process_video_with_limit()
+# (Bagian 4), yang mendukung batas jumlah frame (max_frames) sekaligus.
+# Penggabungan audio asli ditangani terpisah oleh merge_audio_with_ffmpeg()
+# di atas, dipanggil setelah proses frame selesai (lihat main()).
 
 # =====================================================================
 # BAGIAN 3: STREAMLIT UI FUNCTIONS
@@ -427,13 +431,14 @@ def setup_page():
     st.title("🎬 AI Video Enhancer & Filter")
     st.caption(
         "Tingkatkan kualitas video Anda atau terapkan filter estetik (termasuk gaya iPhone). "
-        "Mendukung format MP4, MOV (termasuk video iPhone/HEVC), AVI, dan MKV."
+        "Mendukung format MP4, MOV (termasuk video iPhone/HEVC), AVI, dan MKV. "
+        "Audio asli dan rasio/resolusi video dipertahankan (kecuali Anda sengaja menaikkan Upscale Resolution)."
     )
-    st.warning(
-        "⚠️ Video hasil proses saat ini **tidak menyertakan audio** "
-        "(keterbatasan OpenCV VideoWriter). Lihat komentar TODO di kode "
-        "untuk cara menggabungkan audio kembali menggunakan moviepy.",
-        icon="⚠️",
+    st.info(
+        "ℹ️ Audio asli otomatis digabungkan kembali ke video hasil proses (via FFmpeg). "
+        "Jika Anda membatasi 'Durasi Diproses' di sidebar, audio ikut terpotong menyesuaikan "
+        "panjang video yang diproses.",
+        icon="ℹ️",
     )
 
 
@@ -634,11 +639,39 @@ def main():
         )
 
         progress_bar.progress(1.0, text="Selesai!")
-        st.success(f"✅ Video berhasil diproses dalam {time.time() - start_time:.1f} detik.")
 
-        render_video_preview(input_path, output_path)
+        # Gabungkan kembali audio asli ke video hasil proses (yang masih bisu).
+        # input_path (hasil normalisasi) masih menyimpan audio asli utuh.
+        final_output_path = os.path.join(temp_dir, "final_output_with_audio.mp4")
+        audio_merged = False
+
+        if has_audio_stream(input_path):
+            with st.spinner("Menggabungkan audio asli ke video hasil proses..."):
+                audio_merged = merge_audio_with_ffmpeg(output_path, input_path, final_output_path)
+
+        if audio_merged:
+            final_path = final_output_path
+            st.success(
+                f"✅ Video berhasil diproses dalam {time.time() - start_time:.1f} detik "
+                "(audio asli dipertahankan)."
+            )
+        else:
+            final_path = output_path
+            if has_audio_stream(input_path):
+                st.warning(
+                    "⚠️ Video asli memiliki audio, tetapi penggabungan audio gagal "
+                    "(FFmpeg bermasalah). Video hasil di bawah ini TIDAK memiliki audio.",
+                    icon="⚠️",
+                )
+            else:
+                st.success(
+                    f"✅ Video berhasil diproses dalam {time.time() - start_time:.1f} detik. "
+                    "(Video asli memang tidak memiliki audio.)"
+                )
+
+        render_video_preview(input_path, final_path)
         st.markdown("---")
-        render_download_button(output_path)
+        render_download_button(final_path)
 
 
 def _process_video_with_limit(
